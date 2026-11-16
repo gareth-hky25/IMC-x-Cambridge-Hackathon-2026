@@ -1,161 +1,245 @@
-# Market-making bot for BTC trade count and price range (IMC Hackathon 2026, 1st place)
+# BTC Settlement Market-Making Bot — IMC Hackathon 2026 Winner
 
-I won the IMC Hackathon 2026 overall as a solo entrant. I built a Python bot that made markets in two exchange products whose settlement values come from Coinbase BTC-USD data over one 15 minute window. It finished first with 41,900 P&L against 40,440 for second place, and ended the window flat in one product and 12 lots short in the other.
+I won the IMC Hackathon 2026 overall as a solo entrant. I built this Python bot to make markets in two contracts settled from Coinbase BTC-USD trade data over a 15-minute window. It finished first with **41,900 P&L**, compared with 40,440 for second place, ending flat in Range and 12 lots short in Trades.
 
-## Summary
+- **Trades** settles to the number of Coinbase BTC-USD trades in the window.
+- **Range** settles to the highest Coinbase BTC-USD trade price minus the lowest.
 
-- **The products:** TRADES settled to the number of BTC-USD trades on Coinbase in the window (2,845). RANGE settled to the highest minus the lowest BTC-USD trade price in the window, in dollars (94).
-- **The idea:** both settlement values are partly known before the window ends, since the count and the range only grow. So fair value is what has already happened, plus a forecast of what is left, with uncertainty that shrinks to zero at the close.
-- **How it made money:** it quoted around that fair value, leaned its prices against its inventory to stay near flat, and also took orders from other participants that were clearly mispriced.
-- **What the data shows:** about 92% of P&L came from matched round trips (buying and selling the same product at a profit). The rest was a small residual short in TRADES that settled in my favour. The mispriced-order logic contributed very little on the day.
-- **Main caveat:** this was a single 15 minute window with a 3.6% winning margin, and I validated the bot with a dry run and a short live test, not a backtest. See "Limitations".
+The bot estimates each settlement value as the window unfolds, quotes on both sides while controlling inventory, and separately takes sufficiently mispriced orders from the book. The design and reported results are from one competition run; they should not be read as evidence of performance across many windows.
 
-## 1. The problem
+## Results from the competition run
 
-| Product | Settles to | Tick | Position limit | Contract size | Settled at |
-|---|---|---|---|---|---|
-| TRADES | Number of BTC-USD trades on Coinbase in the window | 10 | ±20 | 1 | 2,845 |
-| RANGE | Max minus min BTC-USD trade price in the window, in USD | 1 | ±60 | 10 | 94 |
+I finished first overall with **41,900 P&L**, compared with 40,440 for second place. The bot finished flat in Range and 12 lots short in Trades.
 
-Both products opened at fixed prices (TRADES 5,000, RANGE 120) with no obvious relation to the day's actual activity, and other participants were also trading them. A market maker here faces two risks: holding a position when the final value comes in far from where it traded, and quoting stale prices while the underlying jumps. The design below is aimed at those two.
+| Product | Bought / sold | Average buy / sell | Final position | P&L |
+|---|---:|---:|---:|---:|
+| Trades | 114 / 126 | 2,969.39 / 3,121.91 | -12 | 20,710 |
+| Range | 257 / 257 | 1,026.30 / 1,108.76 | 0 | 21,190 |
 
-## 2. Fair value
+Range exchange prices include a contract multiplier of 10, so the 82-point average buy/sell difference corresponds to about $8.20 per lot in Range value. The README's original attribution estimated that roughly 92% of total P&L came from matched round trips; the remainder came from the final short Trades position settling below its average sale price. The separate mispriced-order logic contributed little in this run.
 
-The bot recomputed a fair value `F` and a standard deviation `σ` for each product every 200 ms.
+This result came from a single 15-minute window, with a 3.6% margin over second place. The bot was dry-run and briefly live-tested before the event, but it was not backtested.
 
-### TRADES
+## How the bot works
 
-**What is already known.** Coinbase numbers every trade sequentially, so the count so far is `latest trade_id − trade_id at window start`. This is robust to dropped websocket messages, unlike counting messages received.
+```text
+Coinbase WebSocket --+
+                     +--> CoinbaseState --> Trades / Range estimates
+Coinbase REST -------+    (seed and gap backfill)
 
-**What is still to come.** `F = count so far + λ̂ × time remaining`, where `λ̂` is the trade rate per second, estimated as a blend of a fast average (30 second half-life) and a slow one (600 seconds). Near the end the fast one dominates, and early on the slow one does.
+CMI market stream --> BookStore --> Strategy loop (~200 ms)
+        |                              +-- passive quotes
+        |                              +-- inventory and endgame actions
+        +-- latest book --> SnipeWorker +-- aggressive trades
+                                               |
+                                               v
+                                  OrderManager + position ledger
+                                               |
+                                               v
+                                        CMI order API
+```
 
-**Starting rate.** Before any in-window data exists, the rate is a geometric blend of two priors: 75% a same-time-of-day average (5,280 trades per 15 minutes, from the last 10 weekdays at this time of day) and 25% the rate over the previous 30 minutes. As the window progresses, the slow rate moves from that prior to the observed in-window rate, with weight `300 / (300 + seconds elapsed)` on the prior.
+[`bot/main_bot.py`](bot/main_bot.py) wires together the market data, fair-value models, strategy, ledger, and order manager. The key responsibilities are:
 
-**Uncertainty.** `Var = 3 × (expected remaining trades) + (c × expected remaining trades)² + 20²`, with `c = 0.10 × √(time remaining / 900 s)`. The first term allows for trade arrivals being burstier than Poisson, the second for error in the rate, and the third for small counting differences at the window boundary.
-
-**Hard floor.** The count cannot fall, so the bot never offered below the count already observed.
-
-### RANGE
-
-**What is already known.** The maximum `M`, minimum `m` and last price `S` of Coinbase BTC-USD trades inside the window, in dollars. The range so far is `M − m`.
-
-**What is still to come.** Under driftless Brownian motion, the expected amount by which the range grows over the remaining time has a closed form. With `s = σ̂ × √(time remaining)`, `u = (M − S) / s` and `d = (S − m) / s`:
-
-`F = (M − m) + 2s × (g(u) + g(d))`, where `g(x) = φ(x) − x × (1 − Φ(x))`
-
-`φ` and `Φ` are the standard normal density and distribution. The extension is largest when the price sits near the current high or low, and falls away as it moves toward the middle. At the window start (`u = d = 0`) this reduces to the textbook `1.596 s`.
-
-**Volatility `σ̂`.** Parkinson (high-low) estimates from 10 second and 1 minute bars, blended by time remaining. The starting value is 70% the previous 30 minutes and 30% a same-time-of-day average (a 166 dollar range).
-
-**Uncertainty.** The exact variance of that extension, plus 10% for error in `σ̂`.
-
-**Hard floor.** The range cannot shrink, so the bot never offered below `M − m`.
-
-### How fair value behaved on the day
-
-| Time (UTC) | TRADES `F` | TRADES market | RANGE `F` | RANGE market |
-|---|---|---|---|---|
-| 19:09 (before the window) | 3,750 to 3,800 | 3,520 to 3,700 | 129 to 136 | 138 to 178 |
-| 19:20:30 | 3,500 | none quoted | 132 | none quoted |
-| 19:22:30 | 3,193 | 2,960 / 3,000 | 119 | 138 / 139 |
-| 19:25:00 | 2,824 | 2,810 / 2,850 | 100 | 114 / 115 |
-| 19:30:00 | 2,684 | 2,880 / 2,960 | 92 | 101 / 103 |
-| 19:34:50 | 2,779 | 2,840 / 2,860 | 94.1 | 94 / 95 |
-| **Settled** | **2,845** | | **94** | |
-
-The same-time-of-day prior for TRADES (5,280) was far too high for this day, since the actual count was 2,845. The model corrected quickly because the in-window rate takes over, but it means the early quotes were centred too high. My final Coinbase count was 2,777 against 2,845 on the exchange, about 2.4% low, which suggests the organisers counted slightly differently.
-
-## 3. Quoting and inventory control
-
-The bot posted limit orders on both sides of `F`, in two levels per side. The goal was spread income with inventory staying near zero, not a directional view.
-
-- **Spread.** The half-spread is `h = clamp(0.15 × σ, 2 ticks, 100 ticks)` for TRADES and `clamp(0.15 × σ, 2 ticks, 30 ticks)` for RANGE. It is wide early, when `σ` is large, and falls to the 2 tick minimum near the end.
-- **Inventory skew.** With `x = (position − target) / Q`, where `Q` is half the position limit (10 lots for TRADES, 30 for RANGE), the bid is `F − h(1 + 2x)` and the ask is `F + h(1 − 2x)`. Long, and the bid drops while the ask comes toward `F`, so selling is easier than buying. At half the quoting limit the reducing side sits at fair value.
-- **Adverse-selection floor.** Quotes on the side that adds inventory are kept at least `max(2 ticks, 0.05σ)` from `F`, scaled by `(1 + 2|x|)`, so a skewed quote cannot drift into fair value.
-- **Giving up edge to flatten.** The reducing side may be placed up to `0.10σ` through fair value. This rises to `0.5σ` over the last two minutes and whenever inventory is beyond `Q`, and after 45 seconds without the position shrinking it gives up another tick every 10 seconds.
-- **Joining the book.** The bot improves the best external bid or offer by one tick when that stays within the floors above, which gets fills in a thin book. It is limited to one reprice per side every 0.5 seconds.
-- **Anchoring to the market.** Passive quotes are centred on 60% of the external mid and 40% of the model's fair value. This was added during live testing (see section 7).
-- **Sizes.** Base sizes are 2 and 3 lots for TRADES and 5 and 10 for RANGE. The side that adds inventory shrinks as `1 − |x|`. The reducing side can grow to `1 + |x|` times base, capped at what would bring the position to target, so a quote never flips the position.
-- **Position budget.** Only half of each limit is used for market making. The other half is kept free for sweeping mispriced orders. A hard guard also counts every resting and in-flight order, so a full fill of everything I have in the book can never breach a limit.
-- **Toxicity.** Three fills on one side within 15 seconds widen that side by 1.5 times for 30 seconds.
-
-## 4. Taking mispriced orders
-
-A separate thread evaluated every order-book update, so it did not wait for the quoting loop.
-
-| Rule | Trigger | Size |
-|---|---|---|
-| Below the guaranteed floor | An offer at or below the lowest value the product can settle at | No cap (risk-free) |
-| Fat finger | More than 2σ through fair value, or at the minimum or maximum price | Up to the full limit, after checks |
-| Moderate mispricing | 0.5σ through fair value (0.25σ if it reduces inventory) | 3 lots TRADES, 10 lots RANGE in total |
-| Isolated order | An order far beyond a large gap within its own side of the book | Same cap as moderate |
-| Resting traps | Small orders 3σ from fair value, and one tick inside the price limits | Whatever fills |
-
-The checks before a large sweep were: the Coinbase data is under 1.5 seconds old, fair value has not moved by more than half of `σ` in 10 seconds, and the rest of the book agrees with my fair value. The unfilled remainder of a sweep is cancelled immediately, like an immediate-or-cancel order, and my own orders on the same side are cancelled first to make room and to avoid trading with myself.
-
-## 5. Risk and endgame
-
-- **Range spike guard.** When the price is within `max($3, σ√5s)` of the window high or low, RANGE asks are pulled and come back at half size, because a new extreme is about to move settlement.
-- **Trades burst guard.** When the 5 second trade rate exceeds twice my estimate, TRADES asks are pulled for 10 seconds.
-- **Fair value jumps.** A quote is replaced immediately if `F` moves by half the adverse-selection floor.
-- **Flattening.** Over the last 120 seconds the quoting limit shrinks to zero and the give-up above rises, so the bot reaches settlement near flat. In the last 30 seconds it trades against external orders within `0.5σ` of fair value to close what is left, and in the last 5 seconds all quotes come off.
-- **Kill switch.** All quotes are pulled if Coinbase has been silent for more than 3 seconds. A drawdown widens spreads and then stops the product.
-
-## 6. Results
-
-| | TRADES | RANGE |
-|---|---|---|
-| Lots bought / sold | 114 / 126 | 257 / 257 |
-| Average buy / sell (exchange units) | 2,969.39 / 3,121.91 | 1,026.30 / 1,108.76 |
-| Final position | −12 | 0 |
-| P&L | 20,710 | 21,190 |
-
-The exchange shows RANGE prices multiplied by the contract size of 10, so the 82 point gap between average buy and sell is about 8.2 dollars of price per lot.
-
-**Attribution.** TRADES P&L splits into 17,387 from matched round trips (114 × 152.5) and 3,323 from the 12 lots still short at settlement (12 × (3,121.9 − 2,845)). RANGE ended flat, so all of its profit was realised on round trips. Together the round trips account for about 92% of the total. The mispriced-order logic was a small part of that: in the final run I sent about 2,900 quotes but only about 10 sweeps, with roughly 6 lots filled, and most sweep opportunities were skipped because resting quotes and inventory had already used the position-guard capacity.
-
-**Context.** Several of the other top finishers ended near their limits, for example −20 in TRADES and −50 to −60 in RANGE, so their results depended much more on the settlement values than mine did.
-
-## 7. What I tried and dropped
-
-| Idea | Outcome |
+| Component | Responsibility |
 |---|---|
-| A static 5,840 trades per 15 minutes from a web search, which suggested buying TRADES against the 5,000 opening price | Dropped. Live Coinbase data showed a recent rate well below that, so I used a recent-rate estimate and same-time-of-day history. On the day, both were still too high. |
-| Polymarket BTC markets as a fair-value input | Dropped. They price whether BTC goes up or down, which says little about trade count or range. |
-| Deribit implied volatility for RANGE | Built, then switched off. The nearest expiries were pricing the next day's FOMC meeting, and the gap between implied and 15 minute realised volatility could not be calibrated in time. |
-| Binance trade rate as an early signal for TRADES | Built, then switched off. I already see Coinbase's own trade rate live, and Binance gave no useful lead. |
-| Funding rates, open interest and liquidation feeds | Dropped. No measurable improvement in 15 minute forecasts. |
-| Same-time-of-day history for TRADES | Kept. In a leave-one-out test on 10 weekdays it cut pre-window forecast error about threefold against the recent rate alone (log RMSE 0.065 against 0.185). It still misjudged this particular day. |
-| A directional position at the open when the opening book looked mispriced | Restricted to cases where the gap is at least 1.5 times the typical forecast error, with all data sources agreeing. It never triggered. |
-| Centring all quotes on model fair value | Changed. With RANGE at 130 in the model and 167 to 178 in the market, my buy-backs never filled and I sat at −50. Blending the market mid into quote placement and allowing a larger give-up over the limit fixed it. |
-| Repeating capped sweeps without a total cap | Changed. Each sweep was within its cap, but they repeated, and RANGE reached −50. The cap now applies to the total. |
-| Closing out swept positions by locking in at least half of the captured edge | Designed, not built. Swept positions were closed through normal quoting. |
-| Pulling quotes directly from the Coinbase thread | Not built. The spike and burst guards run on the 200 ms loop. |
+| [`bot/coinbase_feed.py`](bot/coinbase_feed.py) | Maintains Coinbase trade IDs, prices, observed window statistics, and volatility/rate inputs. Seeds history and repairs trade-ID gaps through REST. |
+| [`bot/models_fv.py`](bot/models_fv.py) | Pure calculations for Trades and Range fair value, uncertainty, and operational lower-bound values. |
+| [`bot/strategy.py`](bot/strategy.py) | Opening inventory target, passive quote construction, snipe decisions, endgame, and product-level risk controls. |
+| [`bot/execution.py`](bot/execution.py) | API rate limiting, order submissions and cancellations, position reservations, fill accounting, and order reconciliation. |
+| [`bot/config.py`](bot/config.py) | Model, quote, risk, and window parameters. |
+| [`bot/external_feeds.py`](bot/external_feeds.py) | Optional Deribit volatility and Binance activity feeds. Both are disabled in the default configuration. |
 
-## 8. Manual settlement override (built, not used)
+CMI book events replace the stored book snapshot. They also feed a dedicated snipe worker, so aggressive opportunities do not have to wait for the regular strategy iteration. The strategy loop runs approximately every 200 ms. Position polling runs about once per second; order reconciliation runs about every five seconds.
 
-The exchange displays a live settlement value for both products. Near the end of the window I could read that value and use it as a better estimate than the model's, so I built an override for it. I put the expected final value for a product in `settle_override.json`, and the bot reloaded the file within a second. While a value was set for a product, the bot:
+## Fair value and uncertainty
 
-- used my number as fair value and swept every order at least a set edge through it, up to the full position limit (the edge is `EDGE_TRADES` or `EDGE_RANGE`, 100 and 5 by default);
-- stopped passive quoting for that product and turned off the endgame flattening, so the position was held to settlement;
-- went back to normal market making as soon as the value was set back to `null`.
+Both contracts accumulate known settlement value during the window. The model therefore separates the **observed amount so far** from the **expected amount still to come**. The remaining-time component shrinks toward zero as the window closes. The strategy uses the fair value to centre quotes and decide whether external prices are attractive enough to trade. Its uncertainty estimate scales quote widths and trading thresholds.
 
-The intended use was a directional bet when the market traded well away from the displayed settlement value. I did not use it. I was only leading by a small margin in the last few minutes, and the override deliberately holds a large position through settlement, so a wrong reading would have cost more than I stood to gain. The result above is entirely from the market-making and sweep logic.
+### Trades: observed count plus expected remaining trades
 
-## 9. Limitations and what I would do next
+The count is inferred from Coinbase trade IDs rather than by counting WebSocket messages:
 
-- **One window, small margin.** The result comes from a single 15 minute window and a 3.6% lead. It shows the design worked on the day, not that it would win every time.
-- **No backtest.** I validated with a dry-run mode (which logs the orders the bot would send without sending any), a short live test, then the window itself. The one quantitative check on the fair-value prior was a leave-one-out test on 10 weekdays, and the blend weights were chosen on those same days.
-- **Prior too high.** The TRADES prior was far above the day's outcome. A longer history, with a term for market-wide volatility, would calibrate it better, and a small prior weight would limit the damage.
-- **Count mismatch.** My Coinbase count finished 2.4% under the exchange's. I would confirm the exact counting rule with the organisers beforehand.
-- **Sweeps blocked by the guard.** Most sweep opportunities were skipped for lack of position-guard capacity. Reserving capacity for sweeps, or cancelling resting quotes first when a large sweep appears, would use more of them.
-- **Sizes are not optimised.** The spread multiplier (0.15σ), skew strength and sizes came from reasoning, not a parameter search, because there was no historical data to fit them on. With recorded Coinbase and exchange data I would tune them with a replay.
+```text
+n_obs = trade_id_end - trade_id_start
+```
 
-## Files
+Coinbase heartbeats report the latest trade ID, so the count can advance even when individual match messages are missed. The feed detects gaps in received match IDs and queues REST backfill. The window start and end IDs, and the current observed count, are assembled in [`CoinbaseState`](bot/coinbase_feed.py).
 
-- `bot/models_fv.py`: TRADES and RANGE fair value, uncertainty and floor models.
-- `bot/strategy.py`: quoting, sweeping, endgame and risk controls.
-- `bot/coinbase_feed.py`: Coinbase websocket and REST seeding and backfill.
-- `bot/execution.py`: rate limiter, order ledger and position guard.
-- `bot/config.py` and `bot/main_bot.py`: parameters, window configuration and wiring.
-- `docs/`: the specifications the bot was built from.
+The fair-value calculation is:
+
+```text
+F_Trades = n_obs + lambda_hat * tau
+```
+
+Here `tau` is the time remaining and `lambda_hat` is the forecast trade rate. The rate estimator blends:
+
+- A **seasonal prior** of 5,280 trades per 15 minutes.
+- A **30-minute regime estimate** derived from Coinbase trade IDs. Once the target window starts, the regime reference is frozen at that start.
+- A **fast EWMA** of heartbeat trade rates with a 30-second half-life.
+- A **slow in-window rate**, blended from the prior toward the observed count-per-second once at least 10 seconds have elapsed. The prior weight decays on a 300-second scale.
+
+When both seasonal and regime estimates are available and reasonably aligned, the default prior is a geometric blend with 75% seasonal weight and 25% regime weight. A large disagreement shifts more weight to the regime estimate and widens the model's uncertainty. The fast rate receives more weight near the window end; the slow rate matters more earlier. See [`RateEstimator`](bot/models_fv.py).
+
+The remaining-count variance is modelled as:
+
+```text
+Var = phi * mu + (c * mu)^2 + sigma_conv^2
+mu  = lambda_hat * tau
+```
+
+The terms allow for noisy trade arrivals, uncertainty in the forecast rate, and a small count-conversion floor. With the defaults, `phi = 3`, the prior-error coefficient is 0.10 when both prior sources are available, and the conversion floor is 20 trades. Fair value is clamped to at least the count already observed.
+
+### Range: observed range plus expected extension
+
+The observed range is:
+
+```text
+R_now = M - m
+```
+
+Here `M` and `m` are the highest and lowest Coinbase trade prices in the window. The model also tracks the latest price `S` and estimates price volatility `sigma_hat`.
+
+Volatility is estimated from Parkinson high-low variance. A fast estimate uses 10-second bars; slower estimates use one-minute bars and blend a 30-minute regime estimate with the seasonal prior. The seasonal prior is based on an expected 15-minute range of $166. As the window progresses, completed in-window one-minute bars influence the slow estimate. The fast estimate has increasing influence near the end of the window.
+
+Under a driftless Brownian-motion approximation, the expected amount by which the running maximum and minimum extend over the remaining time has a closed form. Let `s = sigma_hat * sqrt(tau)`. The expected upward extension is:
+
+```text
+U    = 2 * s * g((M - S) / s)
+g(x) = phi(x) - x * (1 - Phi(x))
+```
+
+There is a mirrored expression for the downward extension `D`. The fair value is:
+
+```text
+F_Range = R_now + kappa * (U + D)
+```
+
+The configured `kappa` is 1. The expected extension is generally larger when the current price is near a running high or low, and smaller when it is well inside the existing extremes. Uncertainty combines the variances of the two extensions, their configured negative correlation, an allowance for volatility-estimation error, and a small conversion floor. Fair value is clamped to at least the range already observed. See [`range_extension` and `range_fair_value`](bot/models_fv.py).
+
+### Lower-bound values
+
+The fair-value functions keep their estimates above the observed count or range. They also return an `lb` value used by the snipe logic to identify especially cheap buy offers. In the current code, `lb` is **margin-adjusted**: Trades uses a rate-dependent margin below the observed count, and Range uses a $2 margin below the observed range. It is an operational threshold, not the strict mathematical minimum settlement value.
+
+## Trading logic
+
+The bot has two complementary trading paths: passive market making and aggressive taking. Passive orders seek spread income while controlling position; snipes seek to trade against book prices that clear a model-based threshold.
+
+### Passive market making
+
+The default mode is `hybrid`. It can establish a temporary opening inventory target when the market and model are sufficiently far apart and the model passes data-quality checks. The target is gated on feed freshness, enough live data, agreement between prior estimates, and confirmation from the live rate or volatility. It ramps up beyond a 1.5-standardized-gap threshold, is capped at half the hard position limit, and decays back toward zero after the opening phase ends. The target calculation is in [`_update_target`](bot/strategy.py).
+
+The default hard position limits are 20 lots for Trades and 60 lots for Range. Passive market making is scaled to half those limits, leaving headroom for aggressive trading. The bot computes skewed model quotes around its fair value. In simplified form:
+
+```text
+bid = F - h * (1 + beta * x)
+ask = F + h * (1 - beta * x)
+```
+
+Here `h` is a half-spread based on settlement uncertainty, `x` is inventory relative to the target and market-making limit, and `beta` controls the skew. Long inventory lowers the bid and brings the ask closer; short inventory does the reverse. The reducing side may be allowed closer to or through fair value to work inventory down.
+
+The half-spread is 0.15 times model uncertainty, clamped to product-specific tick limits. The bot places two levels per side by default, sizes them by product, tapers the inventory-increasing side as inventory grows, and caps reducing-side size so it does not cross its target. When the external book is available, quotes can join or improve it by one tick, subject to fair-value and adverse-selection limits. For passive quote placement only, the centre is blended 60% toward the external mid and 40% toward model fair value. Snipes remain centred on the model value. Quote construction is in [`compute_quotes`](bot/strategy.py).
+
+### Aggressive trading and book snipes
+
+A separate worker evaluates updated books as they arrive. Normal snipe thresholds are based on model uncertainty and are lower on the side that reduces inventory. A minimum tick-distance threshold also applies. Additional rules can target:
+
+- Offers at or below the operational lower-bound threshold.
+- Prices more than two adjusted standard deviations from fair value.
+- Orders at exchange price limits.
+- Cheap levels separated from the next level by a large book gap.
+
+The bot caps ordinary snipes at 3 lots in Trades and 10 lots in Range. A larger fat-finger sweep is allowed only after checks for Coinbase freshness, fair-value stability, inactive spike/burst guards, and agreement between the model and the surrounding book. If those checks fail, the fat-finger trade is capped. See [`_evaluate_view` and `_large_ok`](bot/strategy.py).
+
+Before sending a snipe, the strategy checks position capacity, cancels same-side resting orders when needed to make room, and cancels opposite-side orders that might otherwise cause a self-trade. It submits a limit order and cancels any unfilled remainder, emulating immediate-or-cancel execution. This path is handled by [`_launch`](bot/strategy.py) and [`OrderManager`](bot/execution.py).
+
+### Position limits and execution safeguards
+
+The order ledger tracks polled and estimated positions, resting orders, pending reservations, and fills. It reserves available capacity before an order is sent, so simultaneous requests cannot each assume the same unused headroom. Fill IDs are deduplicated; when a response already reports a fill, the matching later trade event is not counted twice. Uncertain order submissions retain their reservation until reconciliation can resolve the state.
+
+Order traffic runs in worker pools, separate from the strategy and market-data callbacks. A priority token-bucket rate limiter favours snipes and urgent cancellations over normal quote changes and polling. HTTP 429 responses temporarily reduce the request rate. The order manager periodically reconciles the local order table with the exchange and polls positions.
+
+Other controls include:
+
+- **Range spike guard:** near a new running high or low, Range asks are moved farther away and reduced in size.
+- **Trades burst guard:** a burst in recent Coinbase trade rate makes Trades asks less aggressive for a period.
+- **Inventory ageing:** if inventory does not shrink, the reduce-side price becomes more aggressive over time; skew strength can also increase.
+- **Endgame:** the passive position budget shrinks over the final 120 seconds. In the last 30 seconds, the bot may cross the book to reduce inventory within a fair-value-based reach. Passive quotes come off in the last five seconds.
+- **Stale data:** passive quotes are pulled when the Coinbase feed is stale. At the configured window end, the bot cancels all orders and stops.
+- **Drawdown and API failures:** drawdown can widen quotes or restrict quoting to the reducing side. Repeated order failures trigger cancellation, a pause, and resynchronization.
+
+## Optional settlement override
+
+`settle_override.json` can supply a manual settlement estimate and a minimum edge for either product. While a value is set, passive quotes and automatic endgame flattening stop; the snipe path instead compares orders with that value and may take qualifying levels up to the hard position limit. Setting the product value back to `null` restores normal behaviour. The checked-in file leaves both products unset. This is a deliberate directional mode, and the README-reported competition result did not use it.
+
+## Running the bot
+
+Use Python with the dependencies in [`requirements.txt`](requirements.txt). The bot reads its CMI connection credentials from environment variables and exits at startup if the required values are missing.
+
+Required environment variables:
+
+```text
+CMI_URL
+CMI_USERNAME
+CMI_PASSWORD
+```
+
+Optional variables include `CMI_INVITE`, `TRADES_SYMBOL`, `RANGE_SYMBOL`, and `DRY_RUN`. Set `DRY_RUN=1` to run the feeds, strategy, and order planning without sending or cancelling orders through the API. The default is live order execution (`DRY_RUN=0`).
+
+Install dependencies and launch:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python run_bot.py
+```
+
+On macOS/Linux, activate with `source .venv/bin/activate`. The window is configured in [`window_config.json`](window_config.json); its default mode is `cmi_open`, with a 900-second duration. Set `WINDOW_START_UTC` in that file to provide an explicit start time.
+
+Runtime logs and state CSV files are written to `logs/`. Do not commit credentials or live account data.
+
+## Configuration and current defaults
+
+Most strategy parameters are dataclasses in [`bot/config.py`](bot/config.py). Notable defaults include:
+
+| Setting | Default |
+|---|---:|
+| Window length | 900 seconds |
+| Strategy loop | 200 ms |
+| Trades / Range hard position limits | 20 / 60 lots |
+| Trades / Range passive limits | 10 / 30 lots |
+| Trades / Range snipe caps | 3 / 10 lots |
+| Passive quote centre | 60% external mid, 40% model fair value |
+| Deribit / Binance feeds | Disabled |
+| Manual settlement override | Unset |
+
+The model, quote, risk, and feed defaults are mutable in code, not controlled by a general-purpose configuration file. The settlement window and manual override are the runtime JSON configuration files.
+
+## Limitations and next steps
+
+- **One competition window:** the reported P&L comes from one 15-minute period and a small lead over second place.
+- **No backtest:** the implementation was validated with dry runs and a short live test, not a historical replay.
+- **Trades prior error:** the seasonal prior was too high for the competition window. The in-window rate adjusted as data arrived, but early quotes were centred too high.
+- **Settlement count mismatch:** the bot's final Coinbase count was about 2.4% below the exchange settlement count, suggesting a difference in counting conventions or boundaries that should be resolved before relying on the model.
+- **Limited sweep usage:** resting orders and the position guard consumed capacity that could otherwise have been used for some mispriced-book opportunities.
+- **Unoptimized parameters:** spreads, skew, and sizes were selected by reasoning rather than fitted on a replay dataset.
+
+Useful next steps would be to confirm the exchange's exact settlement-count convention, record synchronized Coinbase and CMI data, replay complete windows, and tune the model and execution parameters on multiple periods. The optional external feeds should remain disabled unless they show measurable improvement under that evaluation.
+
+## Repository map
+
+```text
+base_bot.py             CMI authentication, SSE stream, and base REST API methods
+models.py               Exchange data structures
+run_bot.py              Launcher
+bot/config.py           Parameters, environment, and window configuration
+bot/coinbase_feed.py    Coinbase WebSocket, REST seeding, and backfill
+bot/models_fv.py        Trades and Range fair-value models
+bot/strategy.py         Quoting, sniping, inventory, and risk logic
+bot/execution.py        Order manager, rate limiter, and position ledger
+bot/external_feeds.py   Optional Deribit and Binance inputs
+bot/main_bot.py         Runtime wiring and lifecycle
+docs/                   Strategy specification and design addenda
+logs/                   Runtime logs and recorded state CSVs
+```
