@@ -1,6 +1,6 @@
-# BTC Settlement Market-Making Bot — IMC Hackathon 2026 Winner
+# BTC Settlement Market-Making Bot — IMC x Cambridge Hackathon 2026 (1st place)
 
-I won the IMC Hackathon 2026 overall as a solo entrant. I built this Python bot to make markets in two contracts settled from Coinbase BTC-USD trade data over a 15-minute window. It finished first with **41,900 P&L**, compared with 40,440 for second place, ending flat in Range and 12 lots short in Trades.
+Trading bot for the IMC x Cambridge CUATS hackathon 2026, where we developed bots to trade bitcoin related products. I built this Python bot to make markets in two contracts settled from Coinbase BTC-USD trade data over a 15-minute window. It finished first with **41,900 P&L**, compared with 40,440 for second place, ending flat in Range and 12 lots short in Trades.
 
 - **Trades** settles to the number of Coinbase BTC-USD trades in the window.
 - **Range** settles to the highest Coinbase BTC-USD trade price minus the lowest.
