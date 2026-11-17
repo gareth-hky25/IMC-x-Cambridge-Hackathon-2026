@@ -33,10 +33,10 @@ CMI market stream --> BookStore --> Strategy loop (~200 ms)
         +-- latest book --> SnipeWorker +-- aggressive trades
                                                |
                                                v
-                                  OrderManager + position ledger
+                                 OrderManager + position ledger
                                                |
                                                v
-                                        CMI order API
+                                       CMI order API
 ```
 
 [`bot/main_bot.py`](bot/main_bot.py) wires together the market data, fair-value models, strategy, ledger, and order manager. The key responsibilities are:
@@ -68,11 +68,9 @@ Coinbase heartbeats report the latest trade ID, so the count can advance even wh
 
 The fair-value calculation is:
 
-```text
-F_Trades = n_obs + lambda_hat * tau
-```
+$$F_{\text{Trades}} = n_{\text{obs}} + \hat{\lambda} \cdot \tau$$
 
-Here `tau` is the time remaining and `lambda_hat` is the forecast trade rate. The rate estimator blends:
+Here $\tau$ is the time remaining and $\hat{\lambda}$ is the forecast trade rate. The rate estimator blends:
 
 - A **seasonal prior** of 5,280 trades per 15 minutes.
 - A **30-minute regime estimate** derived from Coinbase trade IDs. Once the target window starts, the regime reference is frozen at that start.
@@ -83,12 +81,12 @@ When both seasonal and regime estimates are available and reasonably aligned, th
 
 The remaining-count variance is modelled as:
 
-```text
-Var = phi * mu + (c * mu)^2 + sigma_conv^2
-mu  = lambda_hat * tau
-```
+$$\begin{aligned}
+\text{Var} &= \phi \cdot \mu + (c \cdot \mu)^2 + \sigma_{\text{conv}}^2 \\
+\mu &= \hat{\lambda} \cdot \tau
+\end{aligned}$$
 
-The terms allow for noisy trade arrivals, uncertainty in the forecast rate, and a small count-conversion floor. With the defaults, `phi = 3`, the prior-error coefficient is 0.10 when both prior sources are available, and the conversion floor is 20 trades. Fair value is clamped to at least the count already observed.
+The terms allow for noisy trade arrivals, uncertainty in the forecast rate, and a small count-conversion floor. With the defaults, $\phi = 3$, the prior-error coefficient is 0.10 when both prior sources are available, and the conversion floor is 20 trades. Fair value is clamped to at least the count already observed.
 
 ### Range: observed range plus expected extension
 
@@ -98,24 +96,22 @@ The observed range is:
 R_now = M - m
 ```
 
-Here `M` and `m` are the highest and lowest Coinbase trade prices in the window. The model also tracks the latest price `S` and estimates price volatility `sigma_hat`.
+Here `M` and `m` are the highest and lowest Coinbase trade prices in the window. The model also tracks the latest price `S` and estimates price volatility $\hat{\sigma}$.
 
 Volatility is estimated from Parkinson high-low variance. A fast estimate uses 10-second bars; slower estimates use one-minute bars and blend a 30-minute regime estimate with the seasonal prior. The seasonal prior is based on an expected 15-minute range of $166. As the window progresses, completed in-window one-minute bars influence the slow estimate. The fast estimate has increasing influence near the end of the window.
 
-Under a driftless Brownian-motion approximation, the expected amount by which the running maximum and minimum extend over the remaining time has a closed form. Let `s = sigma_hat * sqrt(tau)`. The expected upward extension is:
+Under a driftless Brownian-motion approximation, the expected amount by which the running maximum and minimum extend over the remaining time has a closed form. Let $s = \hat{\sigma} \cdot \sqrt{\tau}$. The expected upward extension is:
 
-```text
-U    = 2 * s * g((M - S) / s)
-g(x) = phi(x) - x * (1 - Phi(x))
-```
+$$\begin{aligned}
+U &= 2 \cdot s \cdot g\left(\frac{M - S}{s}\right) \\
+g(x) &= \phi(x) - x \cdot (1 - \Phi(x))
+\end{aligned}$$
 
 There is a mirrored expression for the downward extension `D`. The fair value is:
 
-```text
-F_Range = R_now + kappa * (U + D)
-```
+$$F_{\text{Range}} = R_{\text{now}} + \kappa \cdot (U + D)$$
 
-The configured `kappa` is 1. The expected extension is generally larger when the current price is near a running high or low, and smaller when it is well inside the existing extremes. Uncertainty combines the variances of the two extensions, their configured negative correlation, an allowance for volatility-estimation error, and a small conversion floor. Fair value is clamped to at least the range already observed. See [`range_extension` and `range_fair_value`](bot/models_fv.py).
+The configured $\kappa$ is 1. The expected extension is generally larger when the current price is near a running high or low, and smaller when it is well inside the existing extremes. Uncertainty combines the variances of the two extensions, their configured negative correlation, an allowance for volatility-estimation error, and a small conversion floor. Fair value is clamped to at least the range already observed. See [`range_extension` and `range_fair_value`](bot/models_fv.py).
 
 ### Lower-bound values
 
@@ -131,12 +127,12 @@ The default mode is `hybrid`. It can establish a temporary opening inventory tar
 
 The default hard position limits are 20 lots for Trades and 60 lots for Range. Passive market making is scaled to half those limits, leaving headroom for aggressive trading. The bot computes skewed model quotes around its fair value. In simplified form:
 
-```text
-bid = F - h * (1 + beta * x)
-ask = F + h * (1 - beta * x)
-```
+$$\begin{aligned}
+\text{bid} &= F - h \cdot (1 + \beta \cdot x) \\
+\text{ask} &= F + h \cdot (1 - \beta \cdot x)
+\end{aligned}$$
 
-Here `h` is a half-spread based on settlement uncertainty, `x` is inventory relative to the target and market-making limit, and `beta` controls the skew. Long inventory lowers the bid and brings the ask closer; short inventory does the reverse. The reducing side may be allowed closer to or through fair value to work inventory down.
+Here `h` is a half-spread based on settlement uncertainty, `x` is inventory relative to the target and market-making limit, and $\beta$ controls the skew. Long inventory lowers the bid and brings the ask closer; short inventory does the reverse. The reducing side may be allowed closer to or through fair value to work inventory down.
 
 The half-spread is 0.15 times model uncertainty, clamped to product-specific tick limits. The bot places two levels per side by default, sizes them by product, tapers the inventory-increasing side as inventory grows, and caps reducing-side size so it does not cross its target. When the external book is available, quotes can join or improve it by one tick, subject to fair-value and adverse-selection limits. For passive quote placement only, the centre is blended 60% toward the external mid and 40% toward model fair value. Snipes remain centred on the model value. Quote construction is in [`compute_quotes`](bot/strategy.py).
 
@@ -230,16 +226,16 @@ Useful next steps would be to confirm the exchange's exact settlement-count conv
 ## Repository map
 
 ```text
-base_bot.py             CMI authentication, SSE stream, and base REST API methods
-models.py               Exchange data structures
-run_bot.py              Launcher
-bot/config.py           Parameters, environment, and window configuration
-bot/coinbase_feed.py    Coinbase WebSocket, REST seeding, and backfill
-bot/models_fv.py        Trades and Range fair-value models
-bot/strategy.py         Quoting, sniping, inventory, and risk logic
-bot/execution.py        Order manager, rate limiter, and position ledger
-bot/external_feeds.py   Optional Deribit and Binance inputs
-bot/main_bot.py         Runtime wiring and lifecycle
-docs/                   Strategy specification and design addenda
-logs/                   Runtime logs and recorded state CSVs
+base_bot.py              CMI authentication, SSE stream, and base REST API methods
+models.py                Exchange data structures
+run_bot.py               Launcher
+bot/config.py            Parameters, environment, and window configuration
+bot/coinbase_feed.py     Coinbase WebSocket, REST seeding, and backfill
+bot/models_fv.py         Trades and Range fair-value models
+bot/strategy.py          Quoting, sniping, inventory, and risk logic
+bot/execution.py         Order manager, rate limiter, and position ledger
+bot/external_feeds.py    Optional Deribit and Binance inputs
+bot/main_bot.py          Runtime wiring and lifecycle
+docs/                    Strategy specification and design addenda
+logs/                    Runtime logs and recorded state CSVs
 ```
